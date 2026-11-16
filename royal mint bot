@@ -1,0 +1,159 @@
+"""
+Royal Mint digit bot (Deriv WebSocket API)
+
+Rule: every time the last digit of the tick is 3, buy DIGITOVER with barrier 3
+(wins if the next tick's last digit is 4-9). Runs 24/7 with auto-reconnect.
+
+SETUP
+    pip install websockets
+    export DERIV_TOKEN="your_api_token"   # use a DEMO account token first!
+    python royal_mint_bot.py
+
+Get an app_id at api.deriv.com and a token at app.deriv.com/account/api-token
+(token needs "Read" and "Trade" scopes).
+"""
+
+import asyncio
+import json
+import os
+import time
+
+import websockets
+
+# ------------------- SETTINGS -------------------
+APP_ID = os.getenv("DERIV_APP_ID", "1089")
+TOKEN = os.getenv("DERIV_TOKEN", "")
+SYMBOL = "R_100"          # volatility index to watch
+TRIGGER_DIGIT = 3         # when last digit == this ...
+BARRIER = 3               # ... buy DIGITOVER with this barrier (wins on 4-9)
+STAKE = 1.0               # stake per trade (USD)
+DURATION_TICKS = 1
+CURRENCY = "USD"
+
+# Risk controls (these protect you; do not remove)
+MAX_DAILY_LOSS = 10.0     # stop trading for the day when down this much
+MAX_TRADES_PER_DAY = 500
+COOLDOWN_SECONDS = 0      # minimum gap between trades
+# -------------------------------------------------
+
+URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
+
+
+class State:
+    def __init__(self):
+        self.day = time.strftime("%Y-%m-%d")
+        self.pnl = 0.0
+        self.trades = 0
+        self.wins = 0
+        self.in_trade = False
+        self.last_trade_ts = 0.0
+
+    def roll_day(self):
+        today = time.strftime("%Y-%m-%d")
+        if today != self.day:
+            print(f"New day. Yesterday: {self.trades} trades, PnL {self.pnl:.2f}")
+            self.day, self.pnl, self.trades, self.wins = today, 0.0, 0, 0
+
+    def can_trade(self):
+        self.roll_day()
+        if self.in_trade:
+            return False
+        if self.pnl <= -MAX_DAILY_LOSS:
+            return False
+        if self.trades >= MAX_TRADES_PER_DAY:
+            return False
+        if time.time() - self.last_trade_ts < COOLDOWN_SECONDS:
+            return False
+        return True
+
+
+state = State()
+
+
+def last_digit(quote, pip_size):
+    return int(f"{quote:.{pip_size}f}"[-1])
+
+
+async def send(ws, payload):
+    await ws.send(json.dumps(payload))
+
+
+async def run_once():
+    async with websockets.connect(URL, ping_interval=20, ping_timeout=20) as ws:
+        await send(ws, {"authorize": TOKEN})
+        auth = json.loads(await ws.recv())
+        if "error" in auth:
+            raise SystemExit(f"Auth failed: {auth['error']['message']}")
+        print(f"Logged in: {auth['authorize']['loginid']} "
+              f"balance {auth['authorize']['balance']} {auth['authorize']['currency']}")
+
+        await send(ws, {"ticks": SYMBOL, "subscribe": 1})
+        print(f"Watching {SYMBOL}... trigger digit {TRIGGER_DIGIT} -> DIGITOVER {BARRIER}")
+
+        async for raw in ws:
+            msg = json.loads(raw)
+
+            if "error" in msg:
+                print("API error:", msg["error"]["message"])
+                state.in_trade = False
+                continue
+
+            kind = msg.get("msg_type")
+
+            if kind == "tick":
+                t = msg["tick"]
+                digit = last_digit(t["quote"], t["pip_size"])
+                if digit == TRIGGER_DIGIT and state.can_trade():
+                    state.in_trade = True
+                    state.last_trade_ts = time.time()
+                    await send(ws, {
+                        "buy": 1,
+                        "price": STAKE,
+                        "parameters": {
+                            "amount": STAKE,
+                            "basis": "stake",
+                            "contract_type": "DIGITOVER",
+                            "currency": CURRENCY,
+                            "duration": DURATION_TICKS,
+                            "duration_unit": "t",
+                            "symbol": SYMBOL,
+                            "barrier": str(BARRIER),
+                        },
+                    })
+
+            elif kind == "buy":
+                cid = msg["buy"]["contract_id"]
+                state.trades += 1
+                await send(ws, {"proposal_open_contract": 1,
+                                "contract_id": cid, "subscribe": 1})
+
+            elif kind == "proposal_open_contract":
+                c = msg["proposal_open_contract"]
+                if c.get("is_sold"):
+                    profit = float(c["profit"])
+                    state.pnl += profit
+                    state.wins += profit > 0
+                    state.in_trade = False
+                    print(f"{'WIN ' if profit > 0 else 'LOSS'} {profit:+.2f} | "
+                          f"day PnL {state.pnl:+.2f} | "
+                          f"{state.wins}/{state.trades} wins")
+                    if state.pnl <= -MAX_DAILY_LOSS:
+                        print("Daily loss limit hit. Pausing until tomorrow.")
+
+
+async def main():
+    if not TOKEN:
+        raise SystemExit("Set DERIV_TOKEN first (use a demo account token).")
+    while True:  # 24/7 loop with auto-reconnect
+        try:
+            state.in_trade = False
+            await run_once()
+        except SystemExit:
+            raise
+        except Exception as e:
+            print(f"Connection lost ({e}). Reconnecting in 5s...")
+            await asyncio.sleep(5)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
